@@ -1,0 +1,741 @@
+---
+  title: "Untitled"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(xgboost)
+library(verification)
+library(PRROC)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(ggplot2)
+library(glmnet)
+library(glmbb)
+library(lubridate)
+library(randomForest)
+library(ranger)
+library(mltools)
+library(tidyverse)
+setwd("~/Plan B/nhl")
+```
+
+```{r functions}
+mysmotenc2 <- function(df, smoteamount, k, label = NA, labval = NA){
+  # column types
+  coltypes <- sapply(df, class)
+  # separate into continuous and nominal dfs
+  # continuous df
+  dfcon <- df[,which(coltypes %in% c("numeric", "integer"))]
+  if (!is.na(label)) {
+    dfcon <- dfcon %>% select(-label)
+  }
+  # median standard deviation of each continuous var
+  consds <- median(apply(dfcon, 2, sd))
+  # nominal df
+  dfnom <- df[,-which(coltypes %in% c("numeric", "integer"))]
+  # number of neighbors
+  # continuous smote df
+  smotecon <- data.frame(matrix(nrow = smoteamount*nrow(dfcon), 
+                                ncol = ncol(dfcon)))
+  colnames(smotecon) <- variable.names(dfcon)
+  # nominal smote df
+  smotenom <- data.frame(matrix(nrow = smoteamount*nrow(dfnom), 
+                                ncol = ncol(dfnom)))
+  colnames(smotenom) <- variable.names(dfnom)
+  s <- 1
+  # mode function
+  calculate_mode <- function(x) {
+    uniqx <- unique(x)
+    uniqx[which.max(tabulate(match(x, uniqx)))]
+  }
+  # for each row compute distances and create new smote observations
+  for (i in 1:nrow(df)) {
+    # distance vector
+    subdist <- numeric(nrow(df))
+    # for each continuous var
+    for (con in 1:ncol(dfcon)) {
+      subdist <- subdist + 
+        (.subset2(dfcon, con)[i]-.subset2(dfcon, con))^2
+    }
+    # for each nominal var 
+    for (nom in 1:ncol(dfnom)) {
+      subdist <- subdist + 
+        consds^2*(.subset2(dfnom, nom)[i] != .subset2(dfnom, nom))
+    }
+    # ith value is max in vector to avoid ith distance =0
+    subdist[i] <- max(subdist)
+    # which k nearest
+    minn <- doBy::which.minn(subdist, k)
+    for (sa in 1:smoteamount) {
+      samplek <- sample(1:k, 1)
+      # assign mode of k-nearest obs to smote obs
+      for (nom in 1:ncol(dfnom)) {
+        smotenom[s,nom] <- calculate_mode(dfnom[minn, nom])
+      }
+      # ith row + runif(0,1)*kdirection
+      smotecon[s,] <- dfcon[i,]+
+        runif(1)*(dfcon[minn[samplek],]-dfcon[i,])
+      s <- s + 1
+    }
+    # return smote values
+    smotex <- cbind(smotecon, smotenom)
+    if (!is.na(label)&!is.na(labval)) {
+      smotex[,label] <- labval
+    }
+    # reorder columns to match incoming df
+    #smotex <- smotex %>% select(variable.names(df))
+  }
+  return(smotex)
+}
+sampledf <- function(df, label, overamount = 0, overlab = NA, underamount = 1, underlab = NA){
+  if (overamount < 0) {
+    overamount <- 0
+  }
+  over <- df[df[,label] == overlab,]
+  if (overamount > 0) {
+    overrows <- nrow(over)
+    overrowsample <- sample(1:overrows, overrows*overamount, T)
+    oversample0 <- over[overrowsample,]
+    oversample <- rbind(over, oversample0)
+  } else {
+    oversample <- over
+  }
+  
+  if (underamount < 0) {
+    underamount <- 0
+  }
+  under <- df[df[,label] == underlab,]
+  if (underamount < 1) {
+    underrows <- nrow(under)
+    underrowsample <- sample(1:underrows, underrows*underamount)
+    undersample <- under[underrowsample,]
+  } else { 
+    undersample <- under
+  }
+  
+  newdf <- rbind(oversample, undersample)
+  return(newdf)
+}
+```
+
+```{r data}
+set.seed(1)
+mp0719 <- fread("moneypuck/shots_2007-2019.csv")
+mp2020 <- fread("moneypuck/shots_2020.csv")
+# common columns
+intersectcols <- intersect(colnames(mp0719), colnames(mp2020))
+mp2020 <- mp2020 %>% select(intersectcols)
+mp0719 <- mp0719 %>% select(intersectcols)
+mp <- rbind(mp2020, mp0719)
+rm(mp2020, mp0719, intersectcols)
+
+# shooting/defending goals
+mp$shootingTeamGoals <- if_else(mp$team == "HOME", 
+                                mp$homeTeamGoals, mp$awayTeamGoals)
+mp$defendingTeamGoals <- if_else(mp$team == "AWAY", 
+                                 mp$homeTeamGoals, mp$awayTeamGoals)
+
+mp$lastEventTeam <- if_else(mp$lastEventTeam %in% c("HOME", "AWAY"),
+                            mp$lastEventTeam, "OTHER")
+mp$lastEventTeam2 <- mp$lastEventTeam
+mp$lastEventTeam <- if_else(mp$team == mp$lastEventTeam, 
+                            "SHOOTING", "DEFENDING")
+mp$lastEventTeam <- if_else(mp$lastEventTeam2=="OTHER", "OTHER",
+                            mp$lastEventTeam)
+
+# shooting/defending team skaters
+mp$shootingTeamSkatersOnIce <- mp$shootingTeamForwardsOnIce +
+  mp$shootingTeamDefencemenOnIce
+mp$defendingTeamSkatersOnIce <- mp$defendingTeamForwardsOnIce +
+  mp$defendingTeamDefencemenOnIce
+
+mp$shootingPenalty1Length <- if_else(mp$team == "HOME",mp$homePenalty1Length,
+                                     mp$awayPenalty1Length)
+mp$defendingPenalty1Length <- if_else(mp$team == "AWAY",mp$homePenalty1Length,
+                                      mp$awayPenalty1Length)
+mp$shootingPenalty1TimeLeft <- if_else(mp$team == "HOME",
+                                       mp$homePenalty1TimeLeft,
+                                       mp$awayPenalty1TimeLeft)
+mp$defendingPenalty1TimeLeft <- if_else(mp$team == "AWAY",
+                                        mp$homePenalty1TimeLeft,
+                                        mp$awayPenalty1TimeLeft)
+
+mp$averageRestDifference <- mp$shootingTeamAverageTimeOnIce-
+  mp$defendingTeamAverageTimeOnIce
+mp$shotType <- if_else(mp$shotType == "", "MISSING", mp$shotType)
+mp$shooterLeftRight <- if_else(mp$shooterLeftRight == "", 
+                               "MISSING", mp$shooterLeftRight)
+mp$playerPositionThatDidEvent <- if_else(
+  mp$playerPositionThatDidEvent == "","MISSING",mp$playerPositionThatDidEvent)
+mp$lastEventCategory <- if_else(
+  mp$lastEventCategory %in% c("BLOCK", "FAC", "GIVE", "HIT",
+                              "MISS", "SHOT", "TAKE"),
+  mp$lastEventCategory, "OTHER")
+
+
+mp$lastEventDistFromNet <- sqrt((mp$lastEventxCord_adjusted-89)^2 +
+                                  (mp$lastEventyCord_adjusted)^2)
+mp$lastEventAngleFromNet <- atan2((mp$lastEventyCord_adjusted), 
+                                  -1*(mp$lastEventxCord_adjusted-89))*180/pi
+
+mp <- mp %>% 
+  select(xCordAdjusted, yCordAdjusted, shotType, offWing, shooterLeftRight,
+         period, timeSinceFaceoff, timeSinceLastEvent, lastEventCategory,
+         playerPositionThatDidEvent, lastEventTeam, lastEventxCord_adjusted,
+         lastEventyCord_adjusted, shotDistance, shotAngleAdjusted,
+         distanceFromLastEvent, timeSinceLastEvent, speedFromLastEvent,
+         shotOnEmptyNet, 
+         lastEventDistFromNet, lastEventAngleFromNet,
+         isPlayoffGame, shootingTeamGoals, defendingTeamGoals, 
+         averageRestDifference, shotRebound,
+         # shooting team
+         shootingTeamMaxTimeOnIce, shootingTeamMinTimeOnIce,
+         shootingTeamAverageTimeOnIce, shootingTeamSkatersOnIce, 
+         shootingPenalty1Length, shootingPenalty1TimeLeft,
+         # shooting team forwards
+         shootingTeamForwardsOnIce, 
+         shootingTeamAverageTimeOnIceOfForwards,
+         # shooting team defencemen
+         shootingTeamDefencemenOnIce,
+         shootingTeamAverageTimeOnIceOfDefencemen,
+         # defending team
+         defendingTeamMaxTimeOnIce, defendingTeamMinTimeOnIce,
+         defendingTeamAverageTimeOnIce, defendingTeamSkatersOnIce, 
+         defendingPenalty1Length, defendingPenalty1TimeLeft,
+         # defending team forwards
+         defendingTeamForwardsOnIce, 
+         defendingTeamAverageTimeOnIceOfForwards, 
+         # defending team defencemen
+         defendingTeamDefencemenOnIce,
+         defendingTeamAverageTimeOnIceOfDefencemen,
+         goal)
+
+charcols <- c("season", "isPlayoffGame", "homeTeamGoals", 
+              "awayTeamGoals", "shotOnEmptyNet", "shotRush", "shotRebound",
+              "homeEmptyNet", "awayEmptyNet", "offWing", "isPlayoffGame",
+              "awayPenalty1Length", "homePenalty1Length", 
+              "shootingPenalty1Length", "defendingPenalty1Length")
+charcolsindf <- intersect(charcols, colnames(mp))
+mp <- as.data.frame(mp)
+for (char in 1:length(charcolsindf)) {
+  mp[,charcolsindf[char]] <- as.character(mp[,charcolsindf[char]])
+}
+
+mpou <- mp
+mpsmote <- mp
+
+charcols <- sapply(mp, class)
+for (ch in 1:ncol(mp)) {
+  if (charcols[ch] == "character") {
+    mp[,ch] <- as_factor(mp[,ch])
+  }
+}
+
+tr <- sample(1:nrow(mp), nrow(mp)*.8)
+e.tr <- one_hot(as.data.table(mp[tr,] %>% select(-goal))) %>% as.matrix()
+e.trlab <- mp$goal[tr]
+e.trlab2 <- as_factor(mp$goal[tr])
+e.test <- one_hot(as.data.table(mp[-tr,] %>% select(-goal))) %>% as.matrix()
+e.testlab <- mp$goal[-tr]
+e.testlab2 <- as_factor(mp$goal[-tr])
+e.modtr <- model.matrix(~0+.-goal, mp[tr,])
+e.modtest <- model.matrix(~0+.-goal, mp[-tr,])
+```
+
+### native dataset
+
+```{r boost rf glm lasso}
+tchange <- .01
+thresh <- seq(0, 1, by = tchange)
+
+# normal boost
+nstime <- Sys.time()
+goal.cv <- xgb.cv(e.tr, label = e.trlab, nrounds = 1000, nfold = 4, 
+                  stratified = T, early_stopping_rounds = 50, 
+                  objective = "binary:logistic", print_every_n = 250, 
+                  params = list(max_depth = 4, eta = 0.1,
+                                eval_metric = "aucpr", tree_method = "hist"))
+cvrounds <- goal.cv$best_iteration
+goal.xg <- xgboost(e.tr, label = e.trlab, objective = "binary:logistic",
+                   nrounds = cvrounds, print_every_n = floor(cvrounds/4),
+                   params = list(max_depth = 4, eta = 0.1,
+                                 eval_metric = "aucpr", tree_method = "hist"))
+netime <- Sys.time()
+e.probs <- predict(goal.xg, e.test)
+e.preds <- 1*(e.probs >= 0.5)
+e.tab <- table(e.testlab, e.preds)
+(e.roc <- roc.area(e.testlab, e.probs))
+e.rocplot <- roc.plot(e.testlab, e.probs, thresholds = thresh)
+(boost.pr <- pr.curve(e.probs, weights.class0 = e.testlab, curve = T))
+xgbimp <- xgb.importance(colnames(e.tr), goal.xg)
+
+numCores <- floor(2*detectCores()/3)
+goal.rf <- ranger(x = e.tr, y = e.trlab2, num.threads = numCores, 
+                  num.trees = ceiling(nrow(e.tr)/10000), oob.error = F,
+                  importance = 'impurity', probability = T, keep.inbag = F)
+modrfimp <- as.data.frame(goal.rf$variable.importance)
+modrfimp <- modrfimp %>% arrange(desc(`goal.rf$variable.importance`))
+rangerpreds <- predict(goal.rf, e.test, num.threads = numCores)
+rfpreds <- 1*(rangerpreds$predictions[,2] > .5)
+rf.preds <- mean(rfpreds == e.testlab)
+rf.probs <- rangerpreds$predictions[,2]
+(rfauc <- roc.area(e.testlab, rf.probs))
+rf.rocplot <- roc.plot(e.testlab, rf.probs, thresholds = thresh)
+(rf.pr <- pr.curve(rf.probs, weights.class0 = e.testlab, curve = T))
+
+# binomial
+e.glm <- glm(goal ~ ., data = mp[tr,], family = "binomial")
+e.glm.lodds <- predict(e.glm, mp[-tr,])
+e.glm.probs <- exp(e.glm.lodds)/(1+exp(e.glm.lodds))
+e.glm.preds <- 1*(e.glm.probs>=.5)
+mean(mp$goal[-tr]==e.glm.preds)
+(glm.auc <- roc.area(mp$goal[-tr], e.glm.probs))
+glm.rocplot <- roc.plot(mp$goal[-tr], e.glm.probs, thresholds = thresh)
+(glm.pr <- pr.curve(e.glm.probs, weights.class0 = e.testlab, curve = T))
+glmsum <- summary(e.glm)
+
+# lasso
+lambda <- 10^seq(-1, -6, by = -.25)
+g.lasso <- cv.glmnet(x = e.modtr, y = mp$goal[tr], family = "binomial", 
+                     alpha = 1, nfolds = 4, lambda = lambda, trace.it = T)
+plot(g.lasso)
+l.lodds <- predict(g.lasso, e.modtest)
+l.probs <- exp(l.lodds)/(1+exp(l.lodds))
+l.probs <- as.numeric(l.probs)
+l.preds <- 1*(l.probs>=.5)
+(l.roc <- roc.area(mp$goal[-tr], l.probs))
+l.rocplot <- roc.plot(mp$goal[-tr], l.probs, thresholds = thresh)
+(l.pr <- pr.curve(l.probs, weights.class0 = e.testlab, curve = T))
+glassocoef <- coef(g.lasso)
+
+null.roc <- roc.area(mp$goal[-tr], rep(0, length(e.testlab)))
+null.pr <- pr.curve(rep(0, length(e.testlab)), weights.class0 = e.testlab)
+```
+
+```{r save results}
+nativeresults <- data.frame(
+  # null
+  nullacc = mean(0==e.testlab), nullauc = as.numeric(null.roc[1]),
+  nullaucpr = null.pr$auc.integral,
+  # boost
+  nativeboostacc = mean(e.preds==e.testlab), 
+  nativeboostauc = as.numeric(e.roc[1]), 
+  nativeboostaucpr = boost.pr$auc.integral,
+  # rf
+  nativerfacc = rf.preds, nativerfauc = as.numeric(rfauc[1]),
+  nativerfaucpr = rf.pr$auc.integral,
+  # glm
+  nativeglmacc = mean(mp$goal[-tr]==e.glm.preds),
+  nativeglmauc = as.numeric(glm.auc[1]), nativeglmaucpr = glm.pr$auc.integral,
+  # lasso
+  nativelassoacc = mean(l.preds == mp$goal[-tr]), 
+  nativelassoauc = as.numeric(l.roc[1]), nativelassoaucpr = l.pr$auc.integral
+)
+save(nativeresults, file = "nativeresults.Rda")
+originaltrainresults <- rbind(
+  data.frame(model = "Null", metric = c("Accuracy", "AUC", "AUCpr"), 
+             value = c(mean(0==e.testlab), as.numeric(null.roc[1]), 
+                       null.pr$auc.integral)),
+  data.frame(model = "XGBoost", metric = c("Accuracy", "AUC", "AUCpr"), 
+             value = c(mean(e.preds==e.testlab), as.numeric(e.roc[1]), 
+                       boost.pr$auc.integral)),
+  data.frame(model = "Random Forest", metric = c("Accuracy", "AUC", "AUCpr"), 
+             value = c(rf.preds, as.numeric(rfauc[1]), rf.pr$auc.integral)),
+  data.frame(model = "Logistic Regression", 
+             metric = c("Accuracy", "AUC", "AUCpr"), 
+             value = c(mean(mp$goal[-tr]==e.glm.preds), as.numeric(glm.auc[1]), 
+                       glm.pr$auc.integral)),
+  data.frame(model = "LASSO LR", metric = c("Accuracy", "AUC", "AUCpr"), 
+             value = c(mean(l.preds == mp$goal[-tr]), as.numeric(l.roc[1]), 
+                       l.pr$auc.integral))
+)
+save(originaltrainresults, file = "originaltrainresults.Rda")
+
+rocplotdf <- rbind(
+  data.frame(FPR = e.rocplot$plot.data[, 3, 1],
+             TPR = e.rocplot$plot.data[, 2, 1],
+             Threshold = e.rocplot$plot.data[, 1, 1], Model = "XGBoost"),
+  data.frame(FPR = rf.rocplot$plot.data[, 3, 1], 
+             TPR = rf.rocplot$plot.data[, 2, 1],
+             Threshold = rf.rocplot$plot.data[, 1, 1], 
+             Model = "Random Forest"),
+  data.frame(FPR = l.rocplot$plot.data[, 3, 1], 
+             TPR = l.rocplot$plot.data[, 2, 1],
+             Threshold = l.rocplot$plot.data[, 1, 1], Model = "LASSO LR"),
+  data.frame(FPR = glm.rocplot$plot.data[, 3, 1], 
+             TPR = glm.rocplot$plot.data[, 2, 1],
+             Threshold = glm.rocplot$plot.data[, 1, 1],
+             Model = "Logistic Regression"))
+nativeAUC <- ggplot(rocplotdf)+
+  geom_line(aes(FPR, TPR, linetype = Model, color = Model))+
+  theme(legend.position = c(0.65, 0.35))
+save(nativeAUC, file = "nativeAUC.Rda")
+
+ggplot(rocplotdf)+
+  geom_line(aes(FPR, TPR, linetype = Model, color = Model))+
+  theme(legend.position = c(0.65, 0.35))
+
+
+aucprdf <- rbind(
+  data.frame(TPR = boost.pr$curve[,1], Precision = boost.pr$curve[,2],
+             Threshold = boost.pr$curve[,3], Model = "XGBoost"),
+  data.frame(TPR = rf.pr$curve[,1], Precision = rf.pr$curve[,2], 
+             Threshold = rf.pr$curve[,3], Model = "Random Forest"),
+  data.frame(TPR = l.pr$curve[,1], Precision = l.pr$curve[,2], 
+             Threshold = l.pr$curve[,3], Model = "LASSO LR"),
+  data.frame(TPR = glm.pr$curve[,1], Precision = glm.pr$curve[,2], 
+             Threshold = glm.pr$curve[,3], Model = "Logistic Regression"))
+nativeAUCpr <- ggplot(aucprdf)+
+  geom_line(aes(TPR, Precision, linetype = Model, color = Model))+
+  theme(legend.position = c(0.65, 0.7))
+save(nativeAUCpr, file = "nativeAUCpr.Rda")
+
+aucprdf2 <- aucprdf %>% group_by(round(Threshold, 2), Model) %>% summarise(TPR = mean(TPR), Precision = mean(Precision))
+
+
+ggplot(aucprdf)+
+  geom_line(aes(TPR, Precision, linetype = Model, color = Model))+
+  theme(legend.position = c(0.65, 0.7))
+
+ggplot(aucprdf2)+
+  geom_line(aes(TPR, Precision, linetype = Model, color = Model))+
+  theme(legend.position = c(0.65, 0.7))
+
+originalprobsdf <- data.frame(
+  Labels = e.testlab, XGBoostprob = e.probs, RandomForestprob = rf.probs,
+  LogisticRegressionprob = e.glm.probs, LASSOLRprob = l.probs,
+  XGBoostlab = e.preds, RandomForestlab = rfpreds,
+  LogisticRegressionlab = e.glm.preds, LASSOLRlab = l.preds)
+
+testdf <- cbind(e.test, originalprobsdf)
+testdf$lastEventCategory <- mp$lastEventCategory[-tr]
+testdf$shotType <- mp$shotType[-tr]
+testdf$playerPositionThatDidEvent <- mp$playerPositionThatDidEvent[-tr]
+testdf$shootingPenalty1Length <- mp$shootingPenalty1Length[-tr]
+testdf$defendingPenalty1Length <- mp$defendingPenalty1Length[-tr]
+save(testdf, file = "originalprobsdf.Rda")
+
+save(modrfimp, file = "randomforestimportance.Rda")
+save(xgbimp, file = "xgboostimportance.Rda")
+save(glmsum, file = "glmsummary.Rda")
+save(glassocoef, file = "glasscoef.Rda")
+
+rm(testdf, originalprobsdf, aucprdf, e.modtr, e.tr, glmsum, l.lodds, l.preds,
+   l.probs, e.glm.lodds, e.glm.preds, e.glm.probs, e.preds, e.probs, rf.probs,
+   rfpreds, rangerpreds, boost.pr, e.roc, e.rocplot, goal.cv, goal.xg,
+   rocplotdf, rf.pr, rf.rocplot, rfauc, nativeAUC, nativeAUCpr, l.pr, l.roc,
+   l.rocplot, goal.rf, glm.pr, glm.rocplot, glm.auc, e.glm, g.lasso, 
+   glassocoef, nativeresults, null.pr, null.roc, originaltrainresults)
+```
+
+
+### random oversampling & undersampling
+
+```{r}
+# oversample & undersample parameters
+oversample <- seq(0, 3, by = 1)
+undersample <- seq(0.25, 1, by = .25)
+ougrid <- expand_grid(oversample = oversample, undersample = undersample)
+ougrid <- as.data.frame(ougrid)
+ougrid <- ougrid %>% filter(!(oversample == 0 & undersample > .9))
+numCores <- nrow(ougrid)
+charcols <- sapply(mpou, class)
+for (ch in 1:ncol(mpou)) {
+  if (charcols[ch]=="character") {mpou[,ch] <- as_factor(mpou[,ch])}
+}
+
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+ouresults <- foreach(ou = 1:nrow(ougrid), .combine = rbind, .packages = c('xgboost', 'glmnet', 'verification', 'PRROC', 'mltools', 'tidyverse', 'data.table', 'ranger')) %dopar%{
+  oudf <- sampledf(df = mpou[tr,], label = "goal", 
+                   overamount = ougrid[ou, "oversample"], overlab = 1,
+                   underamount = ougrid[ou, "undersample"] , underlab = 0)
+  # data matrix
+  ou.tr <- one_hot(as.data.table(oudf %>% select(-goal))) %>% as.matrix()
+  ou.trlab <- oudf$goal
+  # boost
+  # cv boost
+  booststime <- Sys.time()
+  goal.cv <- xgb.cv(ou.tr, label = ou.trlab, nrounds = 1000, nfold = 4, 
+                    early_stopping_rounds = 50, stratified = T, 
+                    objective = "binary:logistic", 
+                    params = list(max_depth = 4, eta = 0.1,
+                                  eval_metric = "aucpr", tree_method = "hist"))
+  # boost
+  cvrounds <- goal.cv$best_iteration
+  goal.xg <- xgboost(ou.tr, label = ou.trlab, nrounds = cvrounds,
+                     print_every_n = 500, objective = "binary:logistic", 
+                     params = list(max_depth = 4, eta = 0.1,
+                                   eval_metric = "aucpr", tree_method = "hist"))
+  boostetime <- Sys.time()
+  ouboosttimes <- difftime(boostetime, booststime, units = "secs")
+  ou.probs <- predict(goal.xg, e.test)
+  ou.preds <- 1*(ou.probs >= 0.5)
+  ouboostacc <- mean(ou.preds == e.testlab)
+  ou.roc <- roc.area(e.testlab, ou.probs)
+  ouboostauc <- as.numeric(ou.roc[1])
+  boost.pr <- pr.curve(ou.probs, weights.class0 = e.testlab, curve = T)
+  ouboostaucpr <- boost.pr$auc.integral
+  
+  ou.trlab2 <- as_factor(oudf$goal)
+  ourfstime <- Sys.time()
+  ntrees <- ceiling(nrow(oudf)/10000)
+  goal.rf <- ranger(x = ou.tr, y = ou.trlab2, 
+                    probability = T, keep.inbag = F, oob.error = F)
+  ourfetime <- Sys.time()
+  ourftimes <- difftime(ourfetime, ourfstime, units = "secs")
+  rangerpreds <- predict(goal.rf, e.test, num.threads = numCores)
+  rf.probs <- rangerpreds$predictions[,2]
+  rfpreds <- 1*(rf.probs > .5)
+  ourfacc <- mean(rfpreds == e.testlab)
+  ourfauc <- as.numeric(roc.area(e.testlab, rf.probs)[1])
+  ourfaucpr <- pr.curve(rf.probs, weights.class0 = e.testlab)$auc.integral
+  rm(goal.rf)
+  
+  # glm
+  ou.glm <- glm(goal ~ ., data = oudf, family = "binomial")
+  ou.glm.lodds <- predict(ou.glm, mp[-tr,])
+  ou.glm.probs <- exp(ou.glm.lodds)/(1+exp(ou.glm.lodds))
+  ou.glm.preds <- 1*(ou.glm.probs >= .5)
+  ouglmacc <- mean(e.testlab == ou.glm.preds)
+  ouglmauc <- as.numeric(roc.area(mp$goal[-tr], ou.glm.probs)[1])
+  ouglmaucpr <- pr.curve(ou.glm.probs, weights.class0 = e.testlab)$auc.integral
+  
+  # lasso
+  ou.modtr <- model.matrix(~0+.-goal, oudf)
+  ou.lasso <- cv.glmnet(x = ou.modtr, y = ou.trlab, family = "binomial", 
+                       alpha = 1, nfolds = 4, lambda = lambda)
+  oulasso.lodds <- predict(ou.lasso, e.modtest)
+  oulasso.probs <- as.numeric(exp(oulasso.lodds)/(1+exp(oulasso.lodds)))
+  oulasso.preds <- 1*(oulasso.probs >= .5)
+  oulassoacc <- mean(e.testlab == oulasso.preds)
+  oulassoauc <- as.numeric(roc.area(e.testlab, oulasso.probs)[1])
+  oulassoaucpr <- pr.curve(oulasso.probs, 
+                           weights.class0 = e.testlab)$auc.integral
+  data.frame(over = ougrid[ou, "oversample"],under = ougrid[ou, "undersample"], 
+             ouboosttimes = ouboosttimes, ouboostacc = ouboostacc,
+             ouboostauc = ouboostauc, ouboostaucpr = ouboostaucpr, 
+             ourftimes = ourftimes, ourfacc = ourfacc,
+             ourfauc = ourfauc, ourfaucpr = ourfaucpr, 
+             ouglmacc = ouglmacc, ouglmauc = ouglmauc, ouglmaucpr = ouglmaucpr, 
+             oulassoacc = oulassoacc, oulassoauc = oulassoauc, 
+             oulassoaucpr = oulassoaucpr)
+  
+}
+stopCluster(cl)
+
+oufilename <- paste("ouresults_o", min(oversample), max(oversample), 
+                       "_u", min(undersample)*100, max(undersample)*100,
+                    ".Rda", sep = "")
+save(ouresults, file = oufilename)
+```
+
+
+### smote dataset
+
+```{r}
+# smote parameters
+smotepercent <- seq(1, 3, by = 1)
+neighbors <- seq(1, 5, by = 1)
+smotegrid <- expand.grid(smotepercent = smotepercent, neighbors = neighbors)
+goals <- mpsmote[tr,] %>% filter(goal == 1) %>% 
+  select(xCordAdjusted, yCordAdjusted, shotType, shooterLeftRight,
+         period, shootingTeamGoals, defendingTeamGoals, timeSinceFaceoff, 
+         timeSinceLastEvent, lastEventCategory, playerPositionThatDidEvent,
+         lastEventTeam, lastEventxCord_adjusted, lastEventyCord_adjusted,
+         shotOnEmptyNet, isPlayoffGame,
+         # shooting team
+         shootingTeamMaxTimeOnIce, shootingTeamMinTimeOnIce,
+         shootingPenalty1Length, shootingPenalty1TimeLeft,
+         # shooting team forwards
+         shootingTeamForwardsOnIce, shootingTeamAverageTimeOnIceOfForwards,
+         # shooting team defencemen
+         shootingTeamDefencemenOnIce, shootingTeamAverageTimeOnIceOfDefencemen,
+         # defending team
+         defendingTeamMaxTimeOnIce, defendingTeamMinTimeOnIce,
+         defendingPenalty1Length, defendingPenalty1TimeLeft,
+         # defending team forwards
+         defendingTeamForwardsOnIce, defendingTeamAverageTimeOnIceOfForwards, 
+         # defending team defencemen
+         defendingTeamDefencemenOnIce,defendingTeamAverageTimeOnIceOfDefencemen,
+         goal) %>% as.data.frame()
+numCores <- nrow(smotegrid)
+cl <- makeCluster(numCores)
+registerDoParallel(cl)
+smoteresults <- foreach(s = 1:nrow(smotegrid), .combine = rbind, .packages = c('xgboost', 'glmnet', 'verification', 'PRROC', 'mltools', 'tidyverse', 'data.table', 'ranger')) %dopar% {
+  gsmote <- mysmotenc2(df = goals, smoteamount = smotegrid[s, 1], 
+                       k = smotegrid[s, 2], label = "goal", labval = 1)
+  
+  gsmote$shootingTeamGoals <- round(gsmote$shootingTeamGoals)
+  gsmote$defendingTeamGoals <- round(gsmote$defendingTeamGoals)
+  gsmote$shootingTeamForwardsOnIce <- round(gsmote$shootingTeamForwardsOnIce)
+  gsmote$defendingTeamForwardsOnIce <- round(gsmote$defendingTeamForwardsOnIce)
+  gsmote$shootingTeamDefencemenOnIce <-round(gsmote$shootingTeamDefencemenOnIce)
+  gsmote$defendingTeamDefencemenOnIce <- 
+    round(gsmote$defendingTeamDefencemenOnIce)
+  gsmote$period <- round(gsmote$period)
+  
+  # shot distance
+  gsmote$shotDistance <- sqrt(
+    (gsmote$xCordAdjusted-89)^2+(gsmote$yCordAdjusted)^2)
+  #shotAngleAdjusted, 
+  gsmote$shotAngleAdjusted <- abs(
+    atan2((gsmote$yCordAdjusted), -1*(gsmote$xCordAdjusted-89))*180/pi)
+  #distanceFromLastEvent
+  gsmote$distanceFromLastEvent <- sqrt(
+    (gsmote$xCordAdjusted-gsmote$lastEventxCord_adjusted)^2+
+      (gsmote$yCordAdjusted-gsmote$lastEventyCord_adjusted)^2)
+  # speedFromLastEvent
+  gsmote$speedFromLastEvent <- if_else(gsmote$timeSinceLastEvent == 0, 
+                                       gsmote$distanceFromLastEvent, 
+                                       gsmote$distanceFromLastEvent/
+                                         gsmote$timeSinceLastEvent)
+  
+  gsmote$speedFromLastEvent <- if_else(is.nan(gsmote$speedFromLastEvent), 
+                                       0, gsmote$speedFromLastEvent)
+  # number of skaters shooting
+  gsmote$shootingTeamSkatersOnIce <- gsmote$shootingTeamForwardsOnIce+
+    gsmote$shootingTeamDefencemenOnIce
+  # avg time on ice shooting team
+  # total average TOI
+  gsmote$shootingTeamAverageTimeOnIce <- (
+    gsmote$shootingTeamForwardsOnIce*
+      gsmote$shootingTeamAverageTimeOnIceOfForwards+
+      gsmote$shootingTeamDefencemenOnIce*
+      gsmote$shootingTeamAverageTimeOnIceOfDefencemen)/
+    # divided by num skaters on ice
+    gsmote$shootingTeamSkatersOnIce
+  
+  # number of skaters defending
+  gsmote$defendingTeamSkatersOnIce <- gsmote$defendingTeamForwardsOnIce+
+    gsmote$defendingTeamDefencemenOnIce
+  # avg time on ice defending team
+  # total average TOI
+  gsmote$defendingTeamAverageTimeOnIce <- (
+    gsmote$defendingTeamForwardsOnIce*
+       gsmote$defendingTeamAverageTimeOnIceOfForwards+
+       gsmote$defendingTeamDefencemenOnIce*
+       gsmote$defendingTeamAverageTimeOnIceOfDefencemen)/
+    # divided by num skaters on ice
+    gsmote$defendingTeamSkatersOnIce
+  gsmote$averageRestDifference <- gsmote$shootingTeamAverageTimeOnIce -
+    gsmote$defendingTeamAverageTimeOnIce
+  # shot rebound
+  gsmote$shotRebound <- if_else(
+    gsmote$lastEventCategory %in% c("SHOT", "MISS") & 
+      gsmote$timeSinceLastEvent <= 3, "1", "0")
+  gsmote <- gsmote %>% 
+    mutate(shootingPenalty1TimeLeft = if_else(shootingPenalty1Length == "0", 
+                                              0, shootingPenalty1TimeLeft),
+           defendingPenalty1TimeLeft = if_else(defendingPenalty1Length == "0",
+                                               0, defendingPenalty1TimeLeft))
+  # last event distance & angle
+  gsmote$lastEventDistFromNet <- sqrt((gsmote$lastEventxCord_adjusted-89)^2 +
+                                        (gsmote$lastEventyCord_adjusted)^2)
+  gsmote$lastEventAngleFromNet <- atan2(
+    (gsmote$lastEventyCord_adjusted),
+    -1*(gsmote$lastEventxCord_adjusted-89))*180/pi
+  # offwing
+  gsmote$offWing <- 1*(
+    gsmote$shooterLeftRight == "L" & gsmote$yCordAdjusted < 0|
+      gsmote$shooterLeftRight == "R" & gsmote$yCordAdjusted > 0)
+  
+  smotecols <- intersect(colnames(mpsmote), colnames(gsmote))
+  s.df <- rbind(mpsmote[tr, smotecols], gsmote[,smotecols])
+  s.df <- s.df[,colnames(mp)]
+  charcols <- sapply(s.df, class)
+  for (ch in 1:ncol(s.df)) {
+    if (charcols[ch] == "character") {
+      s.df[,ch] <- as_factor(s.df[,ch])
+    }
+  }
+  s.tr <- one_hot(as.data.table(s.df %>% select(-goal))) %>% as.matrix()
+  s.trlab <- s.df$goal
+  trcols <- colnames(s.tr)
+  s.test <- e.test[,trcols]
+  
+  # boost 
+  # smote cv boost
+  booststime <- Sys.time()
+  sgoal.cv <- xgb.cv(s.tr, label = s.trlab, nrounds = 1000, nfold = 4, 
+                     early_stopping_rounds = 50, 
+                     objective = "binary:logistic", stratified = T,
+                     params = list(max_depth = 4, eta = 0.1, 
+                                   eval_metric = "aucpr",tree_method = "hist"))
+  scvrounds <- sgoal.cv$best_iteration
+  # smote boost
+  sgoal.xg <- xgboost(data = s.tr, label = s.trlab, nrounds = scvrounds,
+                      objective = "binary:logistic", 
+                      params = list(max_depth = 4, eta = 0.1, 
+                                    eval_metric="aucpr", tree_method="hist"))
+  boostetime <- Sys.time()
+  smoteboosttimes <- difftime(boostetime, booststime, units = "secs")
+  
+  s.probs <- predict(sgoal.xg, s.test)
+  s.preds <- 1*(s.probs >= 0.5)
+  smoteboostacc <- mean(s.preds == e.testlab)
+  s.roc <- roc.area(e.testlab, s.probs)
+  smoteboostauc <- as.numeric(s.roc[1])
+  sboost.pr <- pr.curve(s.probs, weights.class0 = e.testlab)
+  smoteboostaucpr <- sboost.pr$auc.integral
+  
+  s.trlab2 <- as_factor(s.trlab)
+  smoterfstime <- Sys.time()
+  ntrees <- ceiling(nrow(s.df)/10000)
+  goal.rf <- ranger(x = s.tr, y = s.trlab2, 
+                    probability = T, keep.inbag = F, oob.error = F)
+  smoterfetime <- Sys.time()
+  smoterftimes <- difftime(smoterfetime, smoterfstime, units = "secs")
+  
+  rangerpreds <- predict(goal.rf, s.test, num.threads = numCores)
+  rf.probs <- rangerpreds$predictions[,2]
+  rfpreds <- 1*(rf.probs > .5)
+  smoterfacc <- mean(rfpreds == e.testlab)
+  smoterfauc <- as.numeric(roc.area(e.testlab, rf.probs)[1])
+  smoterfaucpr <- pr.curve(rf.probs, weights.class0 = e.testlab)$auc.integral
+  rm(goal.rf)
+  
+  # glm
+  smote.glm <- glm(goal ~ ., data = s.df, family = "binomial")
+  smote.glm.lodds <- predict(smote.glm, mp[-tr,])
+  smote.glm.probs <- exp(smote.glm.lodds)/(1+exp(smote.glm.lodds))
+  smote.glm.preds <- 1*(smote.glm.probs >= .5)
+  smoteglmacc <- mean(e.testlab == smote.glm.preds)
+  smoteglmauc <- as.numeric(roc.area(e.testlab, smote.glm.probs)[1])
+  smoteglmaucpr <- pr.curve(smote.glm.probs, 
+                            weights.class0 = e.testlab)$auc.integral
+  
+  # lasso
+  smote.modtr <- model.matrix(~0+.-goal, s.df)
+  smote.lasso <- cv.glmnet(x = smote.modtr, y = s.trlab, family = "binomial", 
+                           alpha = 1, nfolds = 4, lambda = lambda)
+  smotelasso.lodds <- predict(smote.lasso, e.modtest)
+  smotelasso.probs <- as.numeric(exp(smotelasso.lodds)/
+                                   (1+exp(smotelasso.lodds)))
+  smotelasso.preds <- 1*(smotelasso.probs >= .5)
+  smotelassoacc <- mean(mp$goal[-tr] == smotelasso.preds)
+  smotelassoauc <- as.numeric(roc.area(e.testlab, smotelasso.probs)[1])
+  smotelassoaucpr <- pr.curve(smotelasso.probs, 
+                              weights.class0 = e.testlab)$auc.integral
+  data.frame(smotepercent = smotegrid[s, 1], neighbors = smotegrid[s, 2], 
+             smoteboosttimes = smoteboosttimes, smoteboostacc = smoteboostacc,
+             smoteboostauc = smoteboostauc, smoteboostaucpr = smoteboostaucpr, 
+             smoterftimes = smoterftimes, smoterfacc = smoterfacc,
+             smoterfauc = smoterfauc, smoterfaucpr = smoterfaucpr, 
+             smoteglmacc = smoteglmacc, smoteglmauc = smoteglmauc, 
+             smoteglmaucpr = smoteglmaucpr, 
+             smotelassoacc = smotelassoacc, smotelassoauc = smotelassoauc,
+             smotelassoaucpr = smotelassoaucpr)
+}
+stopCluster(cl)
+
+smotefilename <- paste("smoteresults_s", min(smotepercent), max(smotepercent), 
+                       "_n", min(neighbors), max(neighbors), ".Rda", sep = "")
+save(smoteresults, file = smotefilename)
+```

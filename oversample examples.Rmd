@@ -1,0 +1,371 @@
+---
+  title: "Untitled"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+  
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(xgboost)
+library(verification)
+library(PRROC)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(ggplot2)
+library(glmnet)
+library(glmbb)
+library(lubridate)
+library(randomForest)
+library(ranger)
+library(mltools)
+library(tidyverse)
+setwd("~/Plan B/nhl")
+```
+
+```{r functions}
+mysmotenc2 <- function(df, smoteamount, k, label = NA, labval = NA){
+  # column types
+  coltypes <- sapply(df, class)
+  # separate into continuous and nominal dfs
+  # continuous df
+  dfcon <- df[,which(coltypes %in% c("numeric", "integer"))]
+  if (!is.na(label)) {
+    dfcon <- dfcon %>% select(-label)
+  }
+  # median standard deviation of each continuous var
+  consds <- median(apply(dfcon, 2, sd))
+  # nominal df
+  dfnom <- df[,-which(coltypes %in% c("numeric", "integer"))]
+  # number of neighbors
+  # continuous smote df
+  smotecon <- data.frame(matrix(nrow = smoteamount*nrow(dfcon), 
+                                ncol = ncol(dfcon)))
+  colnames(smotecon) <- variable.names(dfcon)
+  # nominal smote df
+  smotenom <- data.frame(matrix(nrow = smoteamount*nrow(dfnom), 
+                                ncol = ncol(dfnom)))
+  colnames(smotenom) <- variable.names(dfnom)
+  s <- 1
+  # mode function
+  calculate_mode <- function(x) {
+    uniqx <- unique(x)
+    uniqx[which.max(tabulate(match(x, uniqx)))]
+  }
+  # for each row compute distances and create new smote observations
+  for (i in 1:nrow(df)) {
+    # distance vector
+    subdist <- numeric(nrow(df))
+    # for each continuous var
+    for (con in 1:ncol(dfcon)) {
+      subdist <- subdist + 
+        (.subset2(dfcon, con)[i]-.subset2(dfcon, con))^2
+    }
+    # for each nominal var 
+    for (nom in 1:ncol(dfnom)) {
+      subdist <- subdist + 
+        consds^2*(.subset2(dfnom, nom)[i] != .subset2(dfnom, nom))
+    }
+    # ith value is max in vector to avoid ith distance =0
+    subdist[i] <- max(subdist)
+    # which k nearest
+    minn <- doBy::which.minn(subdist, k)
+    for (sa in 1:smoteamount) {
+      samplek <- sample(1:k, 1)
+      # assign mode of k-nearest obs to smote obs
+      for (nom in 1:ncol(dfnom)) {
+        smotenom[s,nom] <- calculate_mode(dfnom[minn, nom])
+      }
+      # ith row + runif(0,1)*kdirection
+      smotecon[s,] <- dfcon[i,]+
+        runif(1)*(dfcon[minn[samplek],]-dfcon[i,])
+      s <- s + 1
+    }
+    # return smote values
+    smotex <- cbind(smotecon, smotenom)
+    if (!is.na(label)&!is.na(labval)) {
+      smotex[,label] <- labval
+    }
+    # reorder columns to match incoming df
+    #smotex <- smotex %>% select(variable.names(df))
+  }
+  return(smotex)
+}
+sampledf <- function(df, label, overamount = 0, overlab = NA, underamount = 1, underlab = NA){
+  if (overamount < 0) {
+    overamount <- 0
+  }
+  over <- df[df[,label] == overlab,]
+  if (overamount > 0) {
+    overrows <- nrow(over)
+    overrowsample <- sample(1:overrows, overrows*overamount, T)
+    oversample0 <- over[overrowsample,]
+    oversample <- rbind(over, oversample0)
+  } else {
+    oversample <- over
+  }
+  
+  if (underamount < 0) {
+    underamount <- 0
+  }
+  under <- df[df[,label] == underlab,]
+  if (underamount < 1) {
+    underrows <- nrow(under)
+    underrowsample <- sample(1:underrows, underrows*underamount)
+    undersample <- under[underrowsample,]
+  } else { 
+    undersample <- under
+  }
+  
+  newdf <- rbind(oversample, undersample)
+  return(newdf)
+}
+```
+
+```{r data}
+set.seed(1)
+mp0719 <- fread("moneypuck/shots_2007-2019.csv")
+mp2020 <- fread("moneypuck/shots_2020.csv")
+# common columns
+intersectcols <- intersect(colnames(mp0719), colnames(mp2020))
+mp2020 <- mp2020 %>% select(intersectcols)
+mp0719 <- mp0719 %>% select(intersectcols)
+mp <- rbind(mp2020, mp0719)
+rm(mp2020, mp0719, intersectcols)
+
+mpmiscdf0 <- mp %>% select(season, game_id, teamCode, xGoal)
+
+# shooting/defending goals
+mp$shootingTeamGoals <- if_else(mp$team == "HOME", 
+                                mp$homeTeamGoals, mp$awayTeamGoals)
+mp$defendingTeamGoals <- if_else(mp$team == "AWAY", 
+                                 mp$homeTeamGoals, mp$awayTeamGoals)
+
+mp$lastEventTeam <- if_else(mp$lastEventTeam %in% c("HOME", "AWAY"),
+                            mp$lastEventTeam, "OTHER")
+mp$lastEventTeam2 <- mp$lastEventTeam
+mp$lastEventTeam <- if_else(mp$team == mp$lastEventTeam, 
+                            "SHOOTING", "DEFENDING")
+mp$lastEventTeam <- if_else(mp$lastEventTeam2=="OTHER", "OTHER",
+                            mp$lastEventTeam)
+
+# shooting/defending team skaters
+mp$shootingTeamSkatersOnIce <- mp$shootingTeamForwardsOnIce +
+  mp$shootingTeamDefencemenOnIce
+mp$defendingTeamSkatersOnIce <- mp$defendingTeamForwardsOnIce +
+  mp$defendingTeamDefencemenOnIce
+
+mp$shootingPenalty1Length <- if_else(mp$team == "HOME",mp$homePenalty1Length,
+                                     mp$awayPenalty1Length)
+mp$defendingPenalty1Length <- if_else(mp$team == "AWAY",mp$homePenalty1Length,
+                                      mp$awayPenalty1Length)
+mp$shootingPenalty1TimeLeft <- if_else(mp$team == "HOME",
+                                       mp$homePenalty1TimeLeft,
+                                       mp$awayPenalty1TimeLeft)
+mp$defendingPenalty1TimeLeft <- if_else(mp$team == "AWAY",
+                                        mp$homePenalty1TimeLeft,
+                                        mp$awayPenalty1TimeLeft)
+
+mp$averageRestDifference <- mp$shootingTeamAverageTimeOnIce-
+  mp$defendingTeamAverageTimeOnIce
+mp$shotType <- if_else(mp$shotType == "", "MISSING", mp$shotType)
+mp$shooterLeftRight <- if_else(mp$shooterLeftRight == "", 
+                               "MISSING", mp$shooterLeftRight)
+mp$playerPositionThatDidEvent <- if_else(
+  mp$playerPositionThatDidEvent == "","MISSING",mp$playerPositionThatDidEvent)
+mp$lastEventCategory <- if_else(
+  mp$lastEventCategory %in% c("BLOCK", "FAC", "GIVE", "HIT",
+                              "MISS", "SHOT", "TAKE"),
+  mp$lastEventCategory, "OTHER")
+
+
+mp$lastEventDistFromNet <- sqrt((mp$lastEventxCord_adjusted-89)^2 +
+                                  (mp$lastEventyCord_adjusted)^2)
+mp$lastEventAngleFromNet <- atan2((mp$lastEventyCord_adjusted), 
+                                  -1*(mp$lastEventxCord_adjusted-89))*180/pi
+
+mp <- mp %>% 
+  select(xCordAdjusted, yCordAdjusted, shotType, offWing, shooterLeftRight,
+         period, timeSinceFaceoff, timeSinceLastEvent, lastEventCategory,
+         playerPositionThatDidEvent, lastEventTeam, lastEventxCord_adjusted,
+         lastEventyCord_adjusted, shotDistance, shotAngleAdjusted,
+         distanceFromLastEvent, timeSinceLastEvent, speedFromLastEvent,
+         shotOnEmptyNet, 
+         lastEventDistFromNet, lastEventAngleFromNet,
+         isPlayoffGame, shootingTeamGoals, defendingTeamGoals, 
+         averageRestDifference, shotRebound,
+         # shooting team
+         shootingTeamMaxTimeOnIce, shootingTeamMinTimeOnIce,
+         shootingTeamAverageTimeOnIce, shootingTeamSkatersOnIce, 
+         shootingPenalty1Length, shootingPenalty1TimeLeft,
+         # shooting team forwards
+         shootingTeamForwardsOnIce, 
+         shootingTeamAverageTimeOnIceOfForwards,
+         # shooting team defencemen
+         shootingTeamDefencemenOnIce,
+         shootingTeamAverageTimeOnIceOfDefencemen,
+         # defending team
+         defendingTeamMaxTimeOnIce, defendingTeamMinTimeOnIce,
+         defendingTeamAverageTimeOnIce, defendingTeamSkatersOnIce, 
+         defendingPenalty1Length, defendingPenalty1TimeLeft,
+         # defending team forwards
+         defendingTeamForwardsOnIce, 
+         defendingTeamAverageTimeOnIceOfForwards, 
+         # defending team defencemen
+         defendingTeamDefencemenOnIce,
+         defendingTeamAverageTimeOnIceOfDefencemen,
+         goal)
+
+charcols <- c("season", "isPlayoffGame", "homeTeamGoals", 
+              "awayTeamGoals", "shotOnEmptyNet", "shotRush", "shotRebound",
+              "homeEmptyNet", "awayEmptyNet", "offWing", "isPlayoffGame",
+              "awayPenalty1Length", "homePenalty1Length", 
+              "shootingPenalty1Length", "defendingPenalty1Length")
+charcolsindf <- intersect(charcols, colnames(mp))
+mp <- as.data.frame(mp)
+for (char in 1:length(charcolsindf)) {
+  mp[,charcolsindf[char]] <- as.character(mp[,charcolsindf[char]])
+}
+
+mpou <- mp
+mpsmote <- mp
+
+charcols <- sapply(mp, class)
+for (ch in 1:ncol(mp)) {
+  if (charcols[ch] == "character") {
+    mp[,ch] <- as_factor(mp[,ch])
+  }
+}
+
+tr <- sample(1:nrow(mp), nrow(mp)*.8)
+e.tr <- one_hot(as.data.table(mp[tr,] %>% select(-goal))) %>% as.matrix()
+e.trlab <- mp$goal[tr]
+e.trlab2 <- as_factor(mp$goal[tr])
+e.test <- one_hot(as.data.table(mp[-tr,] %>% select(-goal))) %>% as.matrix()
+e.testlab <- mp$goal[-tr]
+e.testlab2 <- as_factor(mp$goal[-tr])
+e.modtr <- model.matrix(~0+.-goal, mp[tr,])
+e.modtest <- model.matrix(~0+.-goal, mp[-tr,])
+```
+
+### native dataset
+
+```{r boost rf glm lasso}
+tchange <- .01
+thresh <- seq(0, 1, by = tchange)
+
+numCores <- floor(2*detectCores()/3)
+goal.rf <- ranger(x = e.tr, y = e.trlab2, num.threads = numCores, 
+                  num.trees = ceiling(nrow(e.tr)/2500), oob.error = F,
+                  importance = 'impurity', probability = T, keep.inbag = F)
+modrfimp <- as.data.frame(goal.rf$variable.importance)
+modrfimp <- modrfimp %>% arrange(desc(`goal.rf$variable.importance`))
+rangerpreds <- predict(goal.rf, e.test, num.threads = numCores)
+rfpreds <- 1*(rangerpreds$predictions[,2] > .5)
+rf.preds <- mean(rfpreds == e.testlab)
+rf.probs <- rangerpreds$predictions[,2]
+(rfauc <- roc.area(e.testlab, rf.probs))
+rf.rocplot <- roc.plot(e.testlab, rf.probs, thresholds = thresh)
+(rf.pr <- pr.curve(rf.probs, weights.class0 = e.testlab, curve = T))
+
+# binomial
+e.glm <- glm(goal ~ ., data = mp[tr,], family = "binomial")
+e.glm.lodds <- predict(e.glm, mp[-tr,])
+e.glm.probs <- exp(e.glm.lodds)/(1+exp(e.glm.lodds))
+e.glm.preds <- 1*(e.glm.probs>=.5)
+mean(mp$goal[-tr]==e.glm.preds)
+(glm.auc <- roc.area(mp$goal[-tr], e.glm.probs))
+glm.rocplot <- roc.plot(mp$goal[-tr], e.glm.probs, thresholds = thresh)
+(glm.pr <- pr.curve(e.glm.probs, weights.class0 = e.testlab, curve = T))
+```
+
+
+### random oversampling & undersampling
+
+```{r}
+oversample <- 2
+undersample <- 1
+
+for (ch in 1:ncol(mpou)) {
+  if (charcols[ch]=="character") {mpou[,ch] <- as_factor(mpou[,ch])}
+}
+
+oudf <- sampledf(df = mpou[tr,], label = "goal", 
+                   overamount = oversample, overlab = 1,
+                   underamount = undersample , underlab = 0)
+# data matrix
+ou.tr <- one_hot(as.data.table(oudf %>% select(-goal))) %>% as.matrix()
+ou.trlab <- oudf$goal
+# boost
+ou.trlab2 <- as_factor(oudf$goal)
+ntrees <- ceiling(nrow(oudf)/2500)
+goal.rf <- ranger(x = ou.tr, y = ou.trlab2, num.trees = ntrees,
+                  probability = T, keep.inbag = F, oob.error = F)
+rangerpreds <- predict(goal.rf, e.test, num.threads = numCores)
+ourf.probs <- rangerpreds$predictions[,2]
+ourrfpreds <- 1*(rf.probs > .5)
+ourfacc <- mean(rfpreds == e.testlab)
+ourfauc <- as.numeric(roc.area(e.testlab, ourf.probs)[1])
+ourf.rocplot <- roc.plot(e.testlab, ourf.probs, thresholds = thresh)
+ourfaucpr <- pr.curve(ourf.probs, weights.class0 = e.testlab, curve = T)
+rm(goal.rf)
+
+# glm
+ou.glm <- glm(goal ~ ., data = oudf, family = "binomial")
+ou.glm.lodds <- predict(ou.glm, mp[-tr,])
+ou.glm.probs <- exp(ou.glm.lodds)/(1+exp(ou.glm.lodds))
+ou.glm.preds <- 1*(ou.glm.probs >= .5)
+ouglmacc <- mean(e.testlab == ou.glm.preds)
+ouglmauc <- as.numeric(roc.area(mp$goal[-tr], ou.glm.probs)[1])
+ouglm.rocplot <- roc.plot(mp$goal[-tr], ou.glm.probs, thresholds = thresh)
+ouglmaucpr <- pr.curve(ou.glm.probs, weights.class0 = e.testlab, curve = T)
+```
+
+```{r}
+ourocplotdf <- rbind(
+  data.frame(FPR = rf.rocplot$plot.data[, 3, 1], 
+             TPR = rf.rocplot$plot.data[, 2, 1],
+             Threshold = rf.rocplot$plot.data[, 1, 1], 
+             Model = "Random Forest", Sample = "Original"),
+  data.frame(FPR = ourf.rocplot$plot.data[, 3, 1], 
+             TPR = ourf.rocplot$plot.data[, 2, 1],
+             Threshold = ourf.rocplot$plot.data[, 1, 1], 
+             Model = "Random Forest", Sample = "Over/Under"),
+  data.frame(FPR = glm.rocplot$plot.data[, 3, 1], 
+             TPR = glm.rocplot$plot.data[, 2, 1],
+             Threshold = glm.rocplot$plot.data[, 1, 1],
+             Model = "Logistic Regression", Sample = "Original"),
+  data.frame(FPR = ouglm.rocplot$plot.data[, 3, 1], 
+             TPR = ouglm.rocplot$plot.data[, 2, 1],
+             Threshold = ouglm.rocplot$plot.data[, 1, 1],
+             Model = "Logistic Regression", Sample = "Over/Under"))
+ouAUC <- ggplot(ourocplotdf)+
+  geom_line(aes(FPR, TPR, linetype = Sample))+
+  theme(legend.position = c(0.80, 0.35))+
+  facet_grid(cols = vars(Model))
+
+save(ouAUC, file = "ouAUC.Rda")
+
+ouaucprdf <- rbind(
+  data.frame(TPR = rf.pr$curve[,1], Precision = rf.pr$curve[,2], 
+             Threshold = rf.pr$curve[,3], 
+             Model = "Random Forest", Sample = "Original"),
+  data.frame(TPR = glm.pr$curve[,1], Precision = glm.pr$curve[,2], 
+             Threshold = glm.pr$curve[,3], 
+             Model = "Logistic Regression", Sample = "Original"),
+  data.frame(TPR = ourfaucpr$curve[,1], Precision = ourfaucpr$curve[,2], 
+             Threshold = ourfaucpr$curve[,3], 
+             Model = "Random Forest", Sample = "Over/Under"),
+  data.frame(TPR = ouglmaucpr$curve[,1], Precision = ouglmaucpr$curve[,2], 
+             Threshold = ouglmaucpr$curve[,3], 
+             Model = "Logistic Regression", Sample = "Over/Under"))
+
+ouaucprdf2 <- ouaucprdf %>% group_by(round(Threshold, 2), Model, Sample) %>% summarise(TPR = mean(TPR), Precision = mean(Precision))
+
+ouAUCpr2 <- ggplot(ouaucprdf2)+
+  geom_line(aes(TPR, Precision, linetype = Sample, color = Model))+
+  theme(legend.position = c(0.35, 0.7))
+save(ouAUCpr2, file = "ouAUCpr2.Rda")
+```

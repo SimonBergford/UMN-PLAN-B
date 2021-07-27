@@ -22,7 +22,6 @@ library(randomForest)
 library(ranger)
 library(mltools)
 library(tidyverse)
-setwd("~/Plan B/nhl")
 ```
 
 ```{r functions}

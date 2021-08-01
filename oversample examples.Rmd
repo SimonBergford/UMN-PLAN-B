@@ -250,7 +250,7 @@ e.modtr <- model.matrix(~0+.-goal, mp[tr,])
 e.modtest <- model.matrix(~0+.-goal, mp[-tr,])
 ```
 
-### native dataset
+### original dataset
 
 ```{r boost rf glm lasso}
 tchange <- .01
@@ -285,8 +285,8 @@ glm.rocplot <- roc.plot(mp$goal[-tr], e.glm.probs, thresholds = thresh)
 ### random oversampling & undersampling
 
 ```{r}
-oversample <- 2
-undersample <- 1
+oversample <- 1
+undersample <- .75
 
 for (ch in 1:ncol(mpou)) {
   if (charcols[ch]=="character") {mpou[,ch] <- as_factor(mpou[,ch])}
@@ -340,13 +340,24 @@ ourocplotdf <- rbind(
   data.frame(FPR = ouglm.rocplot$plot.data[, 3, 1], 
              TPR = ouglm.rocplot$plot.data[, 2, 1],
              Threshold = ouglm.rocplot$plot.data[, 1, 1],
-             Model = "Logistic Regression", Sample = "Over/Under"))
+             Model = "Logistic Regression", Sample = "Over/Under")) %>% 
+  filter(Threshold >= 0)
 ouAUC <- ggplot(ourocplotdf)+
   geom_line(aes(FPR, TPR, linetype = Sample))+
-  theme(legend.position = c(0.80, 0.35))+
   facet_grid(cols = vars(Model))
 
 save(ouAUC, file = "ouAUC.Rda")
+
+ouFPR <- ggplot(ourocplotdf)+
+  geom_line(aes(Threshold, FPR, linetype = Sample, color = Model))
+
+save(ouFPR, file = "ouFPR.Rda")
+
+
+ouTPR <- ggplot(ourocplotdf)+
+  geom_line(aes(Threshold, TPR, linetype = Sample, color = Model))
+save(ouTPR, file = "ouTPR.Rda")
+
 
 ouaucprdf <- rbind(
   data.frame(TPR = rf.pr$curve[,1], Precision = rf.pr$curve[,2], 
@@ -362,10 +373,15 @@ ouaucprdf <- rbind(
              Threshold = ouglmaucpr$curve[,3], 
              Model = "Logistic Regression", Sample = "Over/Under"))
 
-ouaucprdf2 <- ouaucprdf %>% group_by(round(Threshold, 2), Model, Sample) %>% summarise(TPR = mean(TPR), Precision = mean(Precision))
+ouaucprdf2 <- ouaucprdf %>% 
+  group_by(Threshold = round(Threshold, 2), Model, Sample) %>% 
+  summarise(TPR = mean(TPR), Precision = mean(Precision))
 
 ouAUCpr2 <- ggplot(ouaucprdf2)+
-  geom_line(aes(TPR, Precision, linetype = Sample, color = Model))+
-  theme(legend.position = c(0.35, 0.7))
+  geom_line(aes(TPR, Precision, linetype = Sample, color = Model))
 save(ouAUCpr2, file = "ouAUCpr2.Rda")
+
+ouprecision <- ggplot(ouaucprdf2)+
+  geom_line(aes(Threshold, Precision, linetype = Sample, color = Model))
+save(ouprecision, file = "ouprecision.Rda")
 ```

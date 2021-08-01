@@ -247,7 +247,7 @@ e.modtr <- model.matrix(~0+.-goal, mp[tr,])
 e.modtest <- model.matrix(~0+.-goal, mp[-tr,])
 ```
 
-### native dataset
+### original dataset
 
 ```{r boost rf glm lasso}
 tchange <- .01
